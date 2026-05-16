@@ -47,8 +47,8 @@ for pair in "sentry/sentry.conf.py:sentry/sentry.conf.example.py" \
   if [[ ! -f "$target" ]]; then
     log "Seeding $target from $example"
     cp "$example" "$target"
-    warn "  $target was created from the example. Review it for multinode-specific"
-    warn "  tweaks (uwsgi workers, retention, etc.) — see docs/multinode-setup.md."
+    log "  $target was created from the example. Review it for multinode-specific"
+    log "  tweaks (uwsgi workers, retention, etc.) — see docs/multinode-setup.md."
   fi
 done
 
