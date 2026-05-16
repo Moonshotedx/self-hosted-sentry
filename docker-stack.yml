@@ -1,0 +1,1214 @@
+# Sentry self-hosted — Docker Swarm stack file
+# Deploy with: docker stack deploy --compose-file docker-stack.yml sentry
+#
+# Prerequisites (see scripts/swarm-init.sh and docs/multinode-setup.md):
+#   1. Swarm initialised across BM1/BM2/BM3 with all three as managers.
+#   2. Node labels set:  sentry.role=data (BM1) / app (BM2) / edge (BM3)
+#   3. /etc/docker/daemon.json sets default-ulimits nofile=262144 on every BM.
+#   4. Named volumes pre-created on the correct node (see scripts/swarm-init.sh).
+#   5. Repo cloned to /opt/sentry/self-hosted on every BM (rsync after edits).
+#   6. Images pre-built and distributed:
+#        sentry-self-hosted-local:26.4.2
+#        clickhouse-self-hosted-local:26.4.2
+#        sentry-cleanup-self-hosted-local:26.4.2
+#   7. Bootstrap performed: secret keys, relay credentials, geoip DBs, sentry/config.yml,
+#      sentry/sentry.conf.py.
+
+x-healthcheck-defaults: &healthcheck_defaults
+  interval: "$HEALTHCHECK_INTERVAL"
+  timeout: "$HEALTHCHECK_TIMEOUT"
+  retries: $HEALTHCHECK_RETRIES
+  start_period: "$HEALTHCHECK_START_PERIOD"
+
+x-file-healthcheck: &file_healthcheck_defaults
+  test: ["CMD-SHELL", "rm /tmp/health.txt"]
+  interval: "$HEALTHCHECK_FILE_INTERVAL"
+  timeout: "$HEALTHCHECK_FILE_TIMEOUT"
+  retries: $HEALTHCHECK_FILE_RETRIES
+  start_period: "$HEALTHCHECK_FILE_START_PERIOD"
+
+x-force-no-proxy: &force_no_proxy
+  HTTP_PROXY: ""
+  HTTPS_PROXY: ""
+  http_proxy: ""
+  https_proxy: ""
+
+x-sentry-defaults: &sentry_defaults
+  image: sentry-self-hosted-local:26.4.2
+  # `platform:` is rejected by `docker stack deploy`. The pre-built local image
+  # encodes the target platform — if you need cross-arch builds, pass
+  # --platform=linux/amd64 (or linux/arm64) to `docker build` in swarm-init.sh.
+  entrypoint: "/etc/sentry/entrypoint.sh"
+  command: ["run", "web"]
+  environment:
+    PYTHONUSERBASE: "/data/custom-packages"
+    SENTRY_CONF: "/etc/sentry"
+    SNUBA: "http://snuba-api:1218"
+    VROOM: "http://vroom:8085"
+    DEFAULT_CA_BUNDLE: &ca_bundle "/etc/ssl/certs/ca-certificates.crt"
+    REQUESTS_CA_BUNDLE: *ca_bundle
+    GRPC_DEFAULT_SSL_ROOTS_FILE_PATH_ENV_VAR: *ca_bundle
+    SENTRY_EVENT_RETENTION_DAYS:
+    SENTRY_MAIL_HOST:
+    SENTRY_MAX_EXTERNAL_SOURCEMAP_SIZE:
+    SENTRY_SYSTEM_SECRET_KEY:
+    SENTRY_STATSD_ADDR: "${STATSD_ADDR:-}"
+  volumes:
+    - "sentry-data:/data"
+    - "/opt/sentry/self-hosted/sentry:/etc/sentry"
+    - "/opt/sentry/self-hosted/geoip:/geoip:ro"
+    - "/opt/sentry/self-hosted/certificates:/usr/local/share/ca-certificates:ro"
+
+x-snuba-defaults: &snuba_defaults
+  image: "$SNUBA_IMAGE"
+  environment:
+    SNUBA_SETTINGS: self_hosted
+    CLICKHOUSE_HOST: clickhouse
+    DEFAULT_BROKERS: "kafka:9092"
+    REDIS_HOST: redis
+    UWSGI_MAX_REQUESTS: "10000"
+    UWSGI_DISABLE_LOGGING: "true"
+    SENTRY_EVENT_RETENTION_DAYS:
+    SNUBA_STATSD_ADDR: "${STATSD_ADDR:-}"
+
+services:
+
+  ##############################################
+  # BM3 — EDGE (public-facing, 32 GB)
+  ##############################################
+
+  smtp:
+    image: registry.gitlab.com/egos-tech/smtp
+    volumes:
+      - "sentry-smtp:/var/spool/exim4"
+      - "sentry-smtp-log:/var/log/exim4"
+    environment:
+      MAILNAME: ${SENTRY_MAIL_HOST:-}
+      SES_USER:
+      SES_PASSWORD:
+      SES_REGION:
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == edge]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 256M }
+
+  memcached:
+    image: "memcached:1.6.26-alpine"
+    command: ["-I", "${SENTRY_MAX_EXTERNAL_SOURCEMAP_SIZE:-1M}", "-m", "768"]
+    healthcheck:
+      <<: *healthcheck_defaults
+      test: echo stats | nc 127.0.0.1 11211
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == edge]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 1G }
+
+  redis:
+    image: "redis:6.2.20-alpine"
+    healthcheck:
+      <<: *healthcheck_defaults
+      test: redis-cli ping | grep PONG
+    volumes:
+      - "sentry-redis:/data"
+      - type: bind
+        read_only: true
+        source: /opt/sentry/self-hosted/redis.conf
+        target: /usr/local/etc/redis/redis.conf
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == edge]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 12G }
+
+  nginx:
+    image: "nginx:1.29.5-alpine"
+    ports:
+      - target: 80
+        published: ${SENTRY_BIND:-9000}
+        mode: host
+    volumes:
+      - type: bind
+        read_only: true
+        source: /opt/sentry/self-hosted/nginx.conf
+        target: /etc/nginx/nginx.conf
+      - sentry-nginx-cache:/var/cache/nginx
+      - sentry-nginx-www:/var/www
+    healthcheck:
+      <<: *healthcheck_defaults
+      test: ["CMD", "/usr/bin/curl", "http://localhost"]
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == edge]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 512M }
+
+  relay:
+    image: "$RELAY_IMAGE"
+    environment:
+      RELAY_STATSD_ADDR: ${STATSD_ADDR:-127.0.0.1:8125}
+    volumes:
+      - type: bind
+        read_only: true
+        source: /opt/sentry/self-hosted/relay
+        target: /work/.relay
+      - type: bind
+        read_only: true
+        source: /opt/sentry/self-hosted/geoip
+        target: /geoip
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == edge]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 8G }
+
+  uptime-checker:
+    image: "$UPTIME_CHECKER_IMAGE"
+    command: run
+    environment:
+      UPTIME_CHECKER_RESULTS_KAFKA_CLUSTER: kafka:9092
+      UPTIME_CHECKER_REDIS_HOST: redis://redis:6379
+      UPTIME_CHECKER_ALLOW_INTERNAL_IPS: "false"
+      UPTIME_CHECKER_FAILURE_RETRIES: "1"
+      UPTIME_CHECKER_STATSD_ADDR: ${STATSD_ADDR:-127.0.0.1:8125}
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == edge]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 1G }
+
+  ##############################################
+  # BM1 — DATA (ClickHouse + Kafka + Postgres + Snuba, 64 GB)
+  ##############################################
+
+  postgres:
+    image: "postgres:14.22-bookworm"
+    healthcheck:
+      <<: *healthcheck_defaults
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+    command: ["postgres"]
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: "trust"
+    volumes:
+      - "sentry-postgres:/var/lib/postgresql/data"
+    shm_size: 1024m
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == data]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 6G }
+
+  pgbouncer:
+    image: "edoburu/pgbouncer:v1.24.1-p1"
+    healthcheck:
+      <<: *healthcheck_defaults
+      test: ["CMD-SHELL", "psql -U postgres -p 5432 -h 127.0.0.1 -tA -c \"select 1;\" -d postgres >/dev/null"]
+    environment:
+      DB_USER: ${POSTGRES_USER:-postgres}
+      DB_HOST: postgres
+      DB_NAME: postgres
+      AUTH_TYPE: trust
+      POOL_MODE: transaction
+      ADMIN_USERS: postgres,sentry
+      MAX_CLIENT_CONN: 10000
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == data]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 512M }
+
+  kafka:
+    image: "confluentinc/cp-kafka:7.6.6"
+    environment:
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1001@127.0.0.1:29093"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_NODE_ID: "1001"
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:29092,INTERNAL://0.0.0.0:9093,EXTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:29093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://127.0.0.1:29092,INTERNAL://kafka:9093,EXTERNAL://kafka:9092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_OFFSETS_TOPIC_NUM_PARTITIONS: "1"
+      KAFKA_NUM_PARTITIONS: "12"
+      KAFKA_LOG_RETENTION_HOURS: "24"
+      KAFKA_MESSAGE_MAX_BYTES: "50000000"
+      KAFKA_MAX_REQUEST_SIZE: "50000000"
+      KAFKA_HEAP_OPTS: "-Xmx8G -Xms8G"
+      CONFLUENT_SUPPORT_METRICS_ENABLE: "false"
+      KAFKA_LOG4J_LOGGERS: "kafka.cluster=WARN,kafka.controller=WARN,kafka.coordinator=WARN,kafka.log=WARN,kafka.server=WARN,state.change.logger=WARN"
+      KAFKA_LOG4J_ROOT_LOGLEVEL: "WARN"
+      KAFKA_TOOLS_LOG4J_LOGLEVEL: "WARN"
+    volumes:
+      - "sentry-kafka:/var/lib/kafka/data"
+      - "sentry-kafka-log:/var/lib/kafka/log"
+      - "sentry-secrets:/etc/kafka/secrets"
+    healthcheck:
+      <<: *healthcheck_defaults
+      test: ["CMD-SHELL", "nc -z localhost 9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == data]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 10G }
+
+  clickhouse:
+    image: clickhouse-self-hosted-local:26.4.2
+    volumes:
+      - "sentry-clickhouse:/var/lib/clickhouse"
+      - "sentry-clickhouse-log:/var/log/clickhouse-server"
+      - type: "bind"
+        read_only: true
+        source: "/opt/sentry/self-hosted/clickhouse/config.xml"
+        target: "/etc/clickhouse-server/config.d/sentry.xml"
+      - type: "bind"
+        read_only: true
+        source: "/opt/sentry/self-hosted/clickhouse/default-password.xml"
+        target: "/etc/clickhouse-server/users.d/default-password.xml"
+    environment:
+      # Bumped from 0.3 → 0.6 because BM1 is dedicated to ClickHouse (~38 GB ceiling on 64 GB host).
+      MAX_MEMORY_USAGE_RATIO: 0.6
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "HTTP_PROXY='' http_proxy='' wget -nv -t1 --spider 'http://localhost:8123/' || exit 1"
+      interval: 10s
+      timeout: 10s
+      retries: 30
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == data]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 40G }
+
+  snuba-api:
+    <<: *snuba_defaults
+    healthcheck:
+      <<: *healthcheck_defaults
+      test:
+        - "CMD"
+        - "/bin/bash"
+        - "-c"
+        - 'exec 3<>/dev/tcp/127.0.0.1/1218 && echo -e "GET /health HTTP/1.1\r\nhost: 127.0.0.1\r\n\r\n" >&3 && grep ok -s -m 1 <&3'
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == data]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 2G }
+
+  snuba-errors-consumer:
+    <<: *snuba_defaults
+    command: rust-consumer --storage errors --consumer-group snuba-consumers --auto-offset-reset=latest --max-batch-time-ms 750 --no-strict-offset-reset --health-check-file /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == data]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 1G }
+
+  snuba-outcomes-consumer:
+    <<: *snuba_defaults
+    command: rust-consumer --storage outcomes_raw --consumer-group snuba-consumers --auto-offset-reset=earliest --max-batch-time-ms 750 --no-strict-offset-reset --health-check-file /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == data]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 768M }
+
+  snuba-outcomes-billing-consumer:
+    <<: *snuba_defaults
+    command: rust-consumer --storage outcomes_raw --consumer-group snuba-consumers --auto-offset-reset=earliest --max-batch-time-ms 750 --no-strict-offset-reset --raw-events-topic outcomes-billing --health-check-file /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == data]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 768M }
+
+  snuba-group-attributes-consumer:
+    <<: *snuba_defaults
+    command: rust-consumer --storage group_attributes --consumer-group snuba-group-attributes-consumers --auto-offset-reset=latest --max-batch-time-ms 750 --no-strict-offset-reset --health-check-file /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == data]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 768M }
+
+  snuba-replacer:
+    <<: *snuba_defaults
+    command: replacer --storage errors --auto-offset-reset=latest --no-strict-offset-reset
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == data]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 512M }
+
+  snuba-subscription-consumer-events:
+    <<: *snuba_defaults
+    command: subscriptions-scheduler-executor --dataset events --entity events --auto-offset-reset=latest --no-strict-offset-reset --consumer-group=snuba-events-subscriptions-consumers --followed-consumer-group=snuba-consumers --schedule-ttl=60 --stale-threshold-seconds=900 --health-check-file /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == data]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 512M }
+
+  snuba-transactions-consumer:
+    <<: *snuba_defaults
+    command: rust-consumer --storage transactions --consumer-group transactions_group --auto-offset-reset=latest --max-batch-time-ms 750 --no-strict-offset-reset --health-check-file /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == data]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 1G }
+
+  # Heaviest replay consumer — 2 replicas share Kafka partitions via consumer group.
+  # --max-batch-time-ms bumped 750 → 2000 for larger batches → fewer ClickHouse inserts.
+  snuba-replays-consumer:
+    <<: *snuba_defaults
+    command: rust-consumer --storage replays --consumer-group snuba-consumers --auto-offset-reset=latest --max-batch-time-ms 2000 --no-strict-offset-reset --health-check-file /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 2
+      placement:
+        constraints: [node.labels.sentry.role == data]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 1G }
+
+  snuba-issue-occurrence-consumer:
+    <<: *snuba_defaults
+    command: rust-consumer --storage search_issues --consumer-group generic_events_group --auto-offset-reset=latest --max-batch-time-ms 750 --no-strict-offset-reset --health-check-file /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == data]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 768M }
+
+  snuba-metrics-consumer:
+    <<: *snuba_defaults
+    command: rust-consumer --storage metrics_raw --consumer-group snuba-metrics-consumers --auto-offset-reset=latest --max-batch-time-ms 750 --no-strict-offset-reset --health-check-file /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == data]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 768M }
+
+  snuba-subscription-consumer-transactions:
+    <<: *snuba_defaults
+    command: subscriptions-scheduler-executor --dataset transactions --entity transactions --auto-offset-reset=latest --no-strict-offset-reset --consumer-group=snuba-transactions-subscriptions-consumers --followed-consumer-group=transactions_group --schedule-ttl=60 --stale-threshold-seconds=900 --health-check-file /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == data]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 512M }
+
+  snuba-subscription-consumer-metrics:
+    <<: *snuba_defaults
+    command: subscriptions-scheduler-executor --dataset metrics --entity metrics_sets --entity metrics_counters --auto-offset-reset=latest --no-strict-offset-reset --consumer-group=snuba-metrics-subscriptions-consumers --followed-consumer-group=snuba-metrics-consumers --schedule-ttl=60 --stale-threshold-seconds=900 --health-check-file /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == data]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 512M }
+
+  snuba-subscription-consumer-gen-metrics-distributions:
+    <<: *snuba_defaults
+    command: subscriptions-scheduler-executor --dataset generic_metrics --entity=generic_metrics_distributions --auto-offset-reset=latest --no-strict-offset-reset --consumer-group=snuba-generic-metrics-distributions-subscriptions-schedulers --followed-consumer-group=snuba-gen-metrics-distributions-consumers --schedule-ttl=60 --stale-threshold-seconds=900 --health-check-file /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == data]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 384M }
+
+  snuba-subscription-consumer-generic-metrics-sets:
+    <<: *snuba_defaults
+    command: subscriptions-scheduler-executor --dataset generic_metrics --entity=generic_metrics_sets --auto-offset-reset=latest --no-strict-offset-reset --consumer-group=snuba-generic-metrics-sets-subscriptions-schedulers --followed-consumer-group=snuba-gen-metrics-sets-consumers --schedule-ttl=60 --stale-threshold-seconds=900 --health-check-file /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == data]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 384M }
+
+  snuba-subscription-consumer-generic-metrics-counters:
+    <<: *snuba_defaults
+    command: subscriptions-scheduler-executor --dataset generic_metrics --entity=generic_metrics_counters --auto-offset-reset=latest --no-strict-offset-reset --consumer-group=snuba-generic-metrics-counters-subscriptions-schedulers --followed-consumer-group=snuba-gen-metrics-counters-consumers --schedule-ttl=60 --stale-threshold-seconds=900 --health-check-file /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == data]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 384M }
+
+  snuba-subscription-consumer-generic-metrics-gauges:
+    <<: *snuba_defaults
+    command: subscriptions-scheduler-executor --dataset generic_metrics --entity=generic_metrics_gauges --auto-offset-reset=latest --no-strict-offset-reset --consumer-group=snuba-generic-metrics-gauges-subscriptions-schedulers --followed-consumer-group=snuba-gen-metrics-gauges-consumers --schedule-ttl=60 --stale-threshold-seconds=900 --health-check-file /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == data]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 384M }
+
+  snuba-generic-metrics-distributions-consumer:
+    <<: *snuba_defaults
+    command: rust-consumer --storage generic_metrics_distributions_raw --consumer-group snuba-gen-metrics-distributions-consumers --auto-offset-reset=latest --max-batch-time-ms 750 --no-strict-offset-reset --health-check-file /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == data]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 512M }
+
+  snuba-generic-metrics-sets-consumer:
+    <<: *snuba_defaults
+    command: rust-consumer --storage generic_metrics_sets_raw --consumer-group snuba-gen-metrics-sets-consumers --auto-offset-reset=latest --max-batch-time-ms 750 --no-strict-offset-reset --health-check-file /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == data]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 512M }
+
+  snuba-generic-metrics-counters-consumer:
+    <<: *snuba_defaults
+    command: rust-consumer --storage generic_metrics_counters_raw --consumer-group snuba-gen-metrics-counters-consumers --auto-offset-reset=latest --max-batch-time-ms 750 --no-strict-offset-reset --health-check-file /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == data]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 512M }
+
+  snuba-generic-metrics-gauges-consumer:
+    <<: *snuba_defaults
+    command: rust-consumer --storage generic_metrics_gauges_raw --consumer-group snuba-gen-metrics-gauges-consumers --auto-offset-reset=latest --max-batch-time-ms 750 --no-strict-offset-reset --health-check-file /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == data]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 512M }
+
+  snuba-profiling-profiles-consumer:
+    <<: *snuba_defaults
+    command: rust-consumer --storage profiles --consumer-group snuba-consumers --auto-offset-reset=latest --max-batch-time-ms 1000 --no-strict-offset-reset --health-check-file /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == data]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 768M }
+
+  snuba-profiling-functions-consumer:
+    <<: *snuba_defaults
+    command: rust-consumer --storage functions_raw --consumer-group snuba-consumers --auto-offset-reset=latest --max-batch-time-ms 1000 --no-strict-offset-reset --health-check-file /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == data]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 512M }
+
+  snuba-profiling-profile-chunks-consumer:
+    <<: *snuba_defaults
+    command: rust-consumer --storage profile_chunks --consumer-group snuba-consumers --auto-offset-reset=latest --max-batch-time-ms 1000 --no-strict-offset-reset --health-check-file /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == data]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 512M }
+
+  snuba-eap-items-consumer:
+    <<: *snuba_defaults
+    command: rust-consumer --storage eap_items --consumer-group eap_items_group --auto-offset-reset=latest --max-batch-time-ms 1000 --no-strict-offset-reset --use-rust-processor --health-check-file /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == data]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 768M }
+
+  snuba-subscription-consumer-eap-items:
+    <<: *snuba_defaults
+    command: subscriptions-scheduler-executor --dataset events_analytics_platform --entity eap_items --auto-offset-reset=latest --no-strict-offset-reset --consumer-group=snuba-eap-items-subscriptions-consumers --followed-consumer-group=eap_items_group --schedule-ttl=60 --stale-threshold-seconds=900 --health-check-file /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == data]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 384M }
+
+  ##############################################
+  # BM2 — APP (Sentry web/workers/consumers + SeaweedFS, 48 GB)
+  ##############################################
+
+  seaweedfs:
+    image: "chrislusf/seaweedfs:4.17_large_disk"
+    entrypoint: "weed"
+    command: >-
+        server
+        -dir=/data
+        -filer=true
+        -filer.port=8888
+        -filer.port.grpc=18888
+        -filer.defaultReplicaPlacement=000
+        -master=true
+        -master.port=9333
+        -master.port.grpc=19333
+        -metricsPort=9091
+        -s3=true
+        -s3.port=8333
+        -s3.port.grpc=18333
+        -volume=true
+        -volume.dir.idx=/data/idx
+        -volume.index=leveldbLarge
+        -volume.max=0
+        -volume.preStopSeconds=8
+        -volume.readMode=redirect
+        -volume.port=8080
+        -volume.port.grpc=18080
+        -ip.bind=0.0.0.0
+        -webdav=false
+    environment:
+      <<: *force_no_proxy
+      AWS_ACCESS_KEY_ID: sentry
+      AWS_SECRET_ACCESS_KEY: sentry
+    volumes:
+      - "sentry-seaweedfs:/data"
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "http_proxy='' wget -q -O- http://localhost:8080/healthz http://localhost:9333/cluster/healthz http://localhost:8333/healthz || exit 1"
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      start_period: 60s
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == app]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 4G }
+
+  seaweedfs-admin:
+    image: "chrislusf/seaweedfs:4.17_large_disk"
+    entrypoint: "weed"
+    command: >-
+      admin
+      -port=23646
+      -master=seaweedfs:9333
+    environment:
+      <<: *force_no_proxy
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == app]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 512M }
+
+  seaweedfs-worker:
+    image: "chrislusf/seaweedfs:4.17_large_disk"
+    entrypoint: "weed"
+    command: >-
+      worker
+      -admin=seaweedfs-admin:23646
+      -jobType=all
+    environment:
+      <<: *force_no_proxy
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == app]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 512M }
+
+  symbolicator:
+    image: "$SYMBOLICATOR_IMAGE"
+    environment:
+      SYMBOLICATOR_STATSD_ADDR: ${STATSD_ADDR:-127.0.0.1:8125}
+    command: run -c /etc/symbolicator/config.yml
+    volumes:
+      - "sentry-symbolicator:/data"
+      - type: bind
+        read_only: true
+        source: /opt/sentry/self-hosted/symbolicator
+        target: /etc/symbolicator
+    healthcheck:
+      <<: *healthcheck_defaults
+      test: ["CMD", "/bin/symbolicator", "healthcheck", "-c", "/etc/symbolicator/config.yml"]
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == app]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 3G }
+
+  symbolicator-cleanup:
+    image: "$SYMBOLICATOR_IMAGE"
+    environment:
+      SYMBOLICATOR_STATSD_ADDR: ${STATSD_ADDR:-127.0.0.1:8125}
+    command: "cleanup -c /etc/symbolicator/config.yml --repeat 1h"
+    volumes:
+      - "sentry-symbolicator:/data"
+      - type: bind
+        read_only: true
+        source: /opt/sentry/self-hosted/symbolicator
+        target: /etc/symbolicator
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == app]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 512M }
+
+  web:
+    <<: *sentry_defaults
+    healthcheck:
+      <<: *healthcheck_defaults
+      test:
+        - "CMD"
+        - "/bin/bash"
+        - "-c"
+        - 'exec 3<>/dev/tcp/127.0.0.1/9000 && echo -e "GET /_health/ HTTP/1.1\r\nhost: 127.0.0.1\r\n\r\n" >&3 && grep ok -s -m 1 <&3'
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == app]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 6G }
+
+  events-consumer:
+    <<: *sentry_defaults
+    command: run consumer ingest-events --consumer-group ingest-consumer --healthcheck-file-path /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == app]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 1G }
+
+  attachments-consumer:
+    <<: *sentry_defaults
+    command: run consumer ingest-attachments --consumer-group ingest-consumer --healthcheck-file-path /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == app]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 768M }
+
+  post-process-forwarder-errors:
+    <<: *sentry_defaults
+    command: run consumer --no-strict-offset-reset post-process-forwarder-errors --consumer-group post-process-forwarder --synchronize-commit-log-topic=snuba-commit-log --synchronize-commit-group=snuba-consumers --healthcheck-file-path /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == app]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 1G }
+
+  subscription-consumer-events:
+    <<: *sentry_defaults
+    command: run consumer events-subscription-results --consumer-group query-subscription-consumer --healthcheck-file-path /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == app]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 512M }
+
+  transactions-consumer:
+    <<: *sentry_defaults
+    command: run consumer ingest-transactions --consumer-group ingest-consumer --healthcheck-file-path /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == app]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 1G }
+
+  metrics-consumer:
+    <<: *sentry_defaults
+    command: run consumer ingest-metrics --consumer-group metrics-consumer --healthcheck-file-path /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == app]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 768M }
+
+  generic-metrics-consumer:
+    <<: *sentry_defaults
+    command: run consumer ingest-generic-metrics --consumer-group generic-metrics-consumer --healthcheck-file-path /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == app]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 768M }
+
+  billing-metrics-consumer:
+    <<: *sentry_defaults
+    command: run consumer billing-metrics-consumer --consumer-group billing-metrics-consumer --healthcheck-file-path /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == app]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 512M }
+
+  # Critical replay-recordings consumer. Co-located with SeaweedFS on BM2
+  # so blob writes stay on loopback when SeaweedFS holds the small nodestore bucket.
+  # When replay blobs are sent to external S3 (recommended) this just routes outbound.
+  ingest-replay-recordings:
+    <<: *sentry_defaults
+    command: run consumer ingest-replay-recordings --consumer-group ingest-replay-recordings --healthcheck-file-path /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == app]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 1G }
+
+  ingest-occurrences:
+    <<: *sentry_defaults
+    command: run consumer ingest-occurrences --consumer-group ingest-occurrences --healthcheck-file-path /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == app]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 512M }
+
+  ingest-profiles:
+    <<: *sentry_defaults
+    command: run consumer ingest-profiles --consumer-group ingest-profiles --healthcheck-file-path /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == app]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 512M }
+
+  ingest-monitors:
+    <<: *sentry_defaults
+    command: run consumer ingest-monitors --consumer-group ingest-monitors --healthcheck-file-path /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == app]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 384M }
+
+  ingest-feedback-events:
+    <<: *sentry_defaults
+    command: run consumer ingest-feedback-events --consumer-group ingest-feedback --healthcheck-file-path /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == app]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 384M }
+
+  process-spans:
+    <<: *sentry_defaults
+    command: run consumer --no-strict-offset-reset process-spans --consumer-group process-spans --healthcheck-file-path /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == app]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 512M }
+
+  process-segments:
+    <<: *sentry_defaults
+    command: run consumer --no-strict-offset-reset process-segments --consumer-group process-segments --healthcheck-file-path /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == app]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 512M }
+
+  monitors-clock-tick:
+    <<: *sentry_defaults
+    command: run consumer monitors-clock-tick --consumer-group monitors-clock-tick --healthcheck-file-path /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == app]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 256M }
+
+  monitors-clock-tasks:
+    <<: *sentry_defaults
+    command: run consumer monitors-clock-tasks --consumer-group monitors-clock-tasks --healthcheck-file-path /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == app]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 256M }
+
+  uptime-results:
+    <<: *sentry_defaults
+    command: run consumer uptime-results --consumer-group uptime-results --healthcheck-file-path /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == app]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 384M }
+
+  post-process-forwarder-transactions:
+    <<: *sentry_defaults
+    command: run consumer --no-strict-offset-reset post-process-forwarder-transactions --consumer-group post-process-forwarder --synchronize-commit-log-topic=snuba-transactions-commit-log --synchronize-commit-group transactions_group --healthcheck-file-path /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == app]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 1G }
+
+  post-process-forwarder-issue-platform:
+    <<: *sentry_defaults
+    command: run consumer --no-strict-offset-reset post-process-forwarder-issue-platform --consumer-group post-process-forwarder --synchronize-commit-log-topic=snuba-generic-events-commit-log --synchronize-commit-group generic_events_group --healthcheck-file-path /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == app]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 768M }
+
+  subscription-consumer-transactions:
+    <<: *sentry_defaults
+    command: run consumer transactions-subscription-results --consumer-group query-subscription-consumer --healthcheck-file-path /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == app]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 384M }
+
+  subscription-consumer-eap-items:
+    <<: *sentry_defaults
+    command: run consumer subscription-results-eap-items --consumer-group subscription-results-eap-items --healthcheck-file-path /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == app]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 384M }
+
+  subscription-consumer-metrics:
+    <<: *sentry_defaults
+    command: run consumer metrics-subscription-results --consumer-group query-subscription-consumer --healthcheck-file-path /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == app]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 384M }
+
+  subscription-consumer-generic-metrics:
+    <<: *sentry_defaults
+    command: run consumer generic-metrics-subscription-results --consumer-group query-subscription-consumer --healthcheck-file-path /tmp/health.txt
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == app]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 384M }
+
+  sentry-cleanup:
+    <<: *sentry_defaults
+    image: sentry-cleanup-self-hosted-local:26.4.2
+    entrypoint: "/entrypoint.sh"
+    command: '"0 0 * * * gosu sentry sentry cleanup --days $SENTRY_EVENT_RETENTION_DAYS"'
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == app]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 512M }
+
+  taskbroker:
+    image: "$TASKBROKER_IMAGE"
+    environment:
+      TASKBROKER_KAFKA_CLUSTER: "kafka:9092"
+      TASKBROKER_KAFKA_DEADLETTER_CLUSTER: "kafka:9092"
+      TASKBROKER_DB_PATH: "/opt/sqlite/taskbroker-activations.sqlite"
+      TASKBROKER_STATSD_ADDR: ${STATSD_ADDR:-127.0.0.1:8125}
+    volumes:
+      - sentry-taskbroker:/opt/sqlite
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == app]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 1536M }
+
+  taskscheduler:
+    <<: *sentry_defaults
+    command: run taskworker-scheduler
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == app]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 512M }
+
+  taskworker:
+    <<: *sentry_defaults
+    command: run taskworker --concurrency=$SENTRY_TASKWORKER_CONCURRENCY --rpc-host=taskbroker:50051 --health-check-file-path=/tmp/health.txt --max-child-task-count=10000
+    healthcheck:
+      <<: *file_healthcheck_defaults
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == app]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 6G }
+
+  vroom:
+    image: "$VROOM_IMAGE"
+    environment:
+      SENTRY_KAFKA_BROKERS_PROFILING: "kafka:9092"
+      SENTRY_KAFKA_BROKERS_OCCURRENCES: "kafka:9092"
+      # External S3 endpoint when profile bucket is externalized. Falls back to in-cluster
+      # SeaweedFS if SENTRY_BUCKET_PROFILES is left at the default.
+      # Override via .env.custom: SENTRY_BUCKET_PROFILES=s3://profiles?...&endpoint=...
+      SENTRY_BUCKET_PROFILES: "${SENTRY_BUCKET_PROFILES:-s3://profiles?region=us-east-1&endpoint=seaweedfs:8333&s3ForcePathStyle=true&disableSSL=true}"
+      AWS_ACCESS_KEY: "${SENTRY_PROFILES_S3_ACCESS_KEY:-sentry}"
+      AWS_SECRET_KEY: "${SENTRY_PROFILES_S3_SECRET_KEY:-sentry}"
+      SENTRY_SNUBA_HOST: "http://snuba-api:1218"
+    volumes:
+      - sentry-vroom:/var/vroom/sentry-profiles
+    healthcheck:
+      <<: *healthcheck_defaults
+      test:
+        - "CMD"
+        - "/bin/bash"
+        - "-c"
+        - 'exec 3<>/dev/tcp/127.0.0.1/8085 && echo -e "GET /health HTTP/1.1\r\nhost: 127.0.0.1\r\n\r\n" >&3 && grep OK -s -m 1 <&3'
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.sentry.role == app]
+      restart_policy: { condition: any }
+      resources:
+        limits: { memory: 2G }
+
+volumes:
+  # External: pre-create on the correct node before deploy (see scripts/swarm-init.sh).
+  # The `name:` override stops Docker Swarm from prefixing with the stack name.
+  sentry-data:           { external: true, name: sentry-data }
+  sentry-postgres:       { external: true, name: sentry-postgres }
+  sentry-redis:          { external: true, name: sentry-redis }
+  sentry-kafka:          { external: true, name: sentry-kafka }
+  sentry-kafka-log:      { external: true, name: sentry-kafka-log }
+  sentry-clickhouse:     { external: true, name: sentry-clickhouse }
+  sentry-clickhouse-log: { external: true, name: sentry-clickhouse-log }
+  sentry-seaweedfs:      { external: true, name: sentry-seaweedfs }
+  sentry-symbolicator:   { external: true, name: sentry-symbolicator }
+  sentry-nginx-www:      { external: true, name: sentry-nginx-www }
+  sentry-nginx-cache:    { external: true, name: sentry-nginx-cache }
+  sentry-vroom:          { external: true, name: sentry-vroom }
+  sentry-taskbroker:     { external: true, name: sentry-taskbroker }
+  sentry-secrets:        { external: true, name: sentry-secrets }
+  sentry-smtp:           { external: true, name: sentry-smtp }
+  sentry-smtp-log:       { external: true, name: sentry-smtp-log }
+
