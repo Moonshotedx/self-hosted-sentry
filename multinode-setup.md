@@ -74,7 +74,20 @@ mount -a
 - Docker Engine ≥ 24.x on all 3 BMs
 - Private network connectivity between BM1, BM2, BM3 (open ports 2377/tcp,
   7946/tcp+udp, 4789/udp for Swarm overlay)
-- SSH from BM1 to BM2 and BM3 (used by `swarm-init.sh` to ship images)
+- Passwordless SSH from BM1 to BM2 and BM3 (used by `swarm-init.sh` to ship
+  images, and by every rsync recipe in §"Updating config" below). Set up a
+  dedicated keypair on BM1 and authorise the public key on BM2/BM3, e.g.
+  ```bash
+  # On BM1, as root (or whichever user will run the swarm scripts):
+  ssh-keygen -t ed25519 -f /root/.ssh/sentry-swarm -N ''
+  for host in $BM2_IP $BM3_IP; do
+    ssh-copy-id -i /root/.ssh/sentry-swarm.pub root@$host
+  done
+  ```
+  Then export `SSH_KEY=/root/.ssh/sentry-swarm` (and optionally
+  `SSH_USER=<remote-user>` if not `root`) — `swarm-init.sh` and
+  `swarm-bootstrap-sentry.sh` both honour those vars and bake them into the
+  rsync hints they print.
 - Repo cloned to `/opt/sentry/self-hosted` on **all three** BMs (rsync from BM1
   after every config edit)
 
@@ -88,8 +101,13 @@ cd /opt/sentry/self-hosted
 export BM1_IP=<bm1-private-ip>
 export BM2_IP=<bm2-private-ip>
 export BM3_IP=<bm3-private-ip>
+export SSH_KEY=/root/.ssh/sentry-swarm        # absolute path, authorised on BM2/BM3
+export SSH_USER=root                          # optional, defaults to root
 # Optional: export REGISTRY=registry.example.com:5000  (otherwise images go via ssh+save)
-sudo bash scripts/swarm-init.sh
+
+# `sudo` strips env vars by default — use `sudo -E` (or `sudo -i` then re-export)
+# so swarm-init.sh sees BM*_IP / SSH_KEY / SSH_USER:
+sudo -E bash scripts/swarm-init.sh
 sudo systemctl restart docker     # apply daemon.json ulimits
 ```
 

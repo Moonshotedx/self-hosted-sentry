@@ -31,6 +31,22 @@ cd "$REPO_ROOT"
 # shellcheck disable=SC1091
 source .env
 
+# SSH key / user for the rsync / ssh hints we print at the end (relay creds
+# to BM3, config.yml to BM2). Same convention as scripts/swarm-init.sh: set
+# SSH_KEY to an absolute private-key path and SSH_USER to the remote user
+# (defaults to root). If unset, the printed hints fall back to bare
+# `ssh user@host` / `rsync -a` which will use the running user's default
+# agent / key chain.
+SSH_USER="${SSH_USER:-root}"
+SSH_KEY="${SSH_KEY:-}"
+if [[ -n "$SSH_KEY" ]]; then
+  SSH_HINT="ssh -i ${SSH_KEY} ${SSH_USER}@"
+  RSYNC_HINT="rsync -a -e 'ssh -i ${SSH_KEY}' "
+else
+  SSH_HINT="ssh ${SSH_USER}@"
+  RSYNC_HINT="rsync -a "
+fi
+
 log() { printf "\n\033[1;32m[%s]\033[0m %s\n" "bootstrap" "$*"; }
 warn() { printf "\n\033[1;33m[%s]\033[0m %s\n" "bootstrap" "$*"; }
 err() { printf "\n\033[1;31m[%s]\033[0m %s\n" "bootstrap" "$*"; exit 1; }
@@ -85,7 +101,7 @@ if [[ ! -f relay/credentials.json ]]; then
   fi
   warn "relay/credentials.json was generated on BM1. The relay container is pinned to BM3."
   warn "Sync the file (and relay/config.yml) to BM3 before relay can start:"
-  warn "  rsync -a relay/ root@<BM3-IP>:/opt/sentry/self-hosted/relay/"
+  warn "  ${RSYNC_HINT}relay/ ${SSH_USER}@<BM3-IP>:/opt/sentry/self-hosted/relay/"
 fi
 
 if [[ ! -f geoip/GeoLite2-City.mmdb ]]; then
@@ -202,8 +218,8 @@ Sentry multinode bootstrap complete (BM1 portion).
 
 Still required — must run BY HAND because the target containers aren't on BM1:
 
-  ON BM3 (or rsync the relay/ dir from here):
-    rsync -a /opt/sentry/self-hosted/relay/ root@<BM3-IP>:/opt/sentry/self-hosted/relay/
+  FROM BM1 → push relay creds to BM3:
+    ${RSYNC_HINT}/opt/sentry/self-hosted/relay/ ${SSH_USER}@<BM3-IP>:/opt/sentry/self-hosted/relay/
 
   ON BM2 (sentry_web is pinned there):
     WEB=\$(sudo docker ps -qf "label=com.docker.swarm.service.name=sentry_web")
@@ -215,7 +231,7 @@ Still required — must run BY HAND because the target containers aren't on BM1:
   http://localhost:9000):
     sed -i "s|^# system.url-prefix:.*|system.url-prefix: 'http://<BM3-IP>:${SENTRY_BIND:-9000}'|" \\
       sentry/config.yml
-    rsync -a sentry/config.yml root@<BM2-IP>:/opt/sentry/self-hosted/sentry/config.yml
+    ${RSYNC_HINT}sentry/config.yml ${SSH_USER}@<BM2-IP>:/opt/sentry/self-hosted/sentry/config.yml
     docker service update --force sentry_web
 
 Then verify:
