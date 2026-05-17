@@ -13,13 +13,14 @@
 #      relay logs "launching relay without config folder" and ignores creds).
 #      Generates relay/credentials.json (if missing).
 #   3. Downloads GeoIP databases.
-#   4. Creates the 13 ingest Kafka topics (Sentry consumers don't auto-create;
-#      broker has auto.create.topics.enable=false).
-#   5. Creates SeaweedFS buckets: `nodestore`, `profiles`. Applies lifecycle rules
+#   4. Creates SeaweedFS buckets: `nodestore`, `profiles`. Applies lifecycle rules
 #      keyed to SENTRY_EVENT_RETENTION_DAYS.
-#   6. Runs sentry upgrade --noinput (schema migrations).
-#   7. Runs snuba bootstrap + migrations.
-#   8. Prompts to create the first superuser AND to set system.url-prefix
+#   5. Runs `sentry upgrade --noinput --create-kafka-topics` (schema migrations
+#      AND creation of every Kafka topic Sentry needs — `events`,
+#      `snuba-commit-log`, `outcomes`, `group-attributes`, all `ingest-*`, etc.).
+#      Matches install/set-up-and-migrate-database.sh in the single-node flow.
+#   6. Runs snuba bootstrap + migrations (creates snuba-* topics it owns).
+#   7. Prompts to create the first superuser AND to set system.url-prefix
 #      (without which login hits "CSRF Validation Failed").
 
 set -euo pipefail
@@ -93,37 +94,21 @@ if [[ ! -f geoip/GeoLite2-City.mmdb ]]; then
 fi
 
 # ------------------------------------------------------------------------------
-# 2. Kafka ingest topics
-#    Sentry's consumers subscribe to these topics but don't trigger topic
-#    auto-creation (only producers do). Broker has auto.create.topics.enable=false,
-#    so missing topics → consumers crash-loop every 3-6s on UNKNOWN_TOPIC_OR_PART,
-#    which puts BM2 at >80% CPU. Create them upfront, idempotently.
-#    Snuba creates its own snuba-* topics during `snuba bootstrap` below; these
-#    are the ingest-side ones that Sentry needs.
+# 2. Wait for Kafka to be reachable
+#    All Sentry topics (ingest-*, events, transactions, snuba-commit-log,
+#    snuba-transactions-commit-log, snuba-generic-events-commit-log, outcomes,
+#    group-attributes, etc.) are created by `sentry upgrade --create-kafka-topics`
+#    in step 4 below — the same flag the single-node install.sh uses
+#    (install/set-up-and-migrate-database.sh). We don't create them by hand here
+#    because the manual list always drifts behind upstream's, and missing
+#    downstream topics (especially snuba-commit-log) silently break
+#    post-process-forwarder → no issue grouping → no notification emails.
+#    Snuba's own snuba-* topics are still created by `snuba bootstrap` below.
+#    This just blocks until the kafka container is up on BM1 so step 4/5 don't
+#    race the broker.
 # ------------------------------------------------------------------------------
 KAFKA_CID="$(find_local_container kafka)"
-INGEST_TOPICS=(
-  ingest-attachments
-  ingest-events
-  ingest-transactions
-  ingest-metrics
-  ingest-performance-metrics
-  ingest-replay-recordings
-  ingest-feedback-events
-  ingest-occurrences
-  profiles
-  buffered-segments
-  ingest-spans
-  monitors-clock-tasks
-  uptime-results
-)
-log "Creating Kafka ingest topics (idempotent)"
-for topic in "${INGEST_TOPICS[@]}"; do
-  docker exec "$KAFKA_CID" kafka-topics --bootstrap-server localhost:9092 \
-    --create --if-not-exists --topic "$topic" \
-    --partitions 1 --replication-factor 1 >/dev/null
-done
-log "Created/verified ${#INGEST_TOPICS[@]} ingest topics"
+log "Kafka is up ($KAFKA_CID). Topic creation deferred to step 4 ('sentry upgrade --create-kafka-topics' on BM2) and step 5 ('snuba bootstrap')."
 
 # ------------------------------------------------------------------------------
 # 3. SeaweedFS buckets + lifecycle policies
@@ -180,11 +165,15 @@ fi
 WEB_CID="$(docker ps --filter "label=com.docker.swarm.service.name=sentry_web" --format '{{.ID}}' | head -1 || true)"
 if [[ -z "$WEB_CID" ]]; then
   warn "sentry_web is not running on this host (it's pinned to BM2). SSH to BM2 and run:"
-  warn "  docker exec \$(docker ps -qf name=sentry_web) sentry upgrade --noinput"
+  warn "  docker exec \$(docker ps -qf name=sentry_web) sentry upgrade --noinput --create-kafka-topics"
   warn "  docker exec -it \$(docker ps -qf name=sentry_web) sentry createuser --email <admin@example.com> --superuser"
 else
-  log "Running sentry upgrade (database migrations)"
-  docker exec "$WEB_CID" sentry upgrade --noinput
+  # --create-kafka-topics matches install/set-up-and-migrate-database.sh and
+  # is what creates `events`, `snuba-commit-log`, `outcomes`, etc. Without it,
+  # post-process-forwarder-errors cannot synchronize on snuba-commit-log →
+  # issues are written to ClickHouse but never grouped → no notifications/emails.
+  log "Running sentry upgrade (database migrations + Kafka topic creation)"
+  docker exec "$WEB_CID" sentry upgrade --noinput --create-kafka-topics
   log "All migrations applied. Create the first superuser interactively:"
   echo "  docker exec -it $WEB_CID sentry createuser --email <admin@example.com> --superuser"
 fi
@@ -210,7 +199,7 @@ Still required — must run BY HAND because the target containers aren't on BM1:
 
   ON BM2 (sentry_web is pinned there):
     WEB=\$(sudo docker ps -qf "label=com.docker.swarm.service.name=sentry_web")
-    sudo docker exec    "\$WEB" sentry upgrade --noinput          # idempotent
+    sudo docker exec    "\$WEB" sentry upgrade --noinput --create-kafka-topics   # idempotent
     sudo docker exec -it "\$WEB" sentry createuser --superuser
 
   ON BM1 (fix CSRF before browser login — otherwise login fails with

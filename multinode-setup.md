@@ -167,7 +167,7 @@ A few services will crash-loop until step 4 finishes — that's expected:
 - `sentry_web` — missing `SENTRY_SYSTEM_SECRET_KEY` (created in step 4a)
 - `sentry_relay` — missing `relay/credentials.json` (step 4d)
 - `sentry_nginx` — can't yet resolve `relay`/`web`; self-recovers when they're up
-- All `sentry_*-consumer` services — missing Kafka topics (step 4c)
+- All `sentry_*-consumer` services — missing Kafka topics (created in step 4e by `sentry upgrade --create-kafka-topics`)
 
 ### 4. Bootstrap application state
 
@@ -200,25 +200,23 @@ docker stack deploy --compose-file docker-stack.yml sentry
 
 Now `sentry_web` stops crash-looping on `ImproperlyConfigured: SECRET_KEY`.
 
-#### 4c. On BM1 — create the 13 ingest Kafka topics
+#### 4c. Kafka topics — handled by `sentry upgrade --create-kafka-topics` in 4e
 
-The Kafka broker has `auto.create.topics.enable=false`, and Sentry consumers
-don't trigger auto-creation (only producers do). These 13 topics MUST exist
-before consumers stop crash-looping with `UNKNOWN_TOPIC_OR_PART`:
+Previous versions of this guide had a "create 13 ingest topics" step here. That
+list always drifted behind upstream — most importantly it never included the
+downstream topics (`events`, `snuba-commit-log`, `snuba-transactions-commit-log`,
+`snuba-generic-events-commit-log`, `outcomes`, `outcomes-billing`,
+`group-attributes`, `shared-resources-usage`, …) that the post-process
+forwarders rely on. The visible symptom was: events land in ClickHouse and
+appear in Discover/raw search, but the Issues stream stays empty and no
+notification emails get sent, because `post-process-forwarder-errors` cannot
+synchronize on a `snuba-commit-log` topic that doesn't exist.
 
-```bash
-KAFKA=$(docker ps -qf "label=com.docker.swarm.service.name=sentry_kafka")
-for t in ingest-attachments ingest-events ingest-transactions ingest-metrics \
-         ingest-performance-metrics ingest-replay-recordings ingest-feedback-events \
-         ingest-occurrences profiles buffered-segments ingest-spans \
-         monitors-clock-tasks uptime-results; do
-  docker exec "$KAFKA" kafka-topics --bootstrap-server localhost:9092 \
-    --create --if-not-exists --topic "$t" --partitions 1 --replication-factor 1
-done
-```
-
-Symptom if you skip this: 80%+ CPU on BM2 because ~9 consumers restart every
-3–6 s, each spinning up a fresh Python interpreter.
+The canonical fix is the same one the single-node `install.sh` uses:
+`sentry upgrade --create-kafka-topics`. It is idempotent and creates every
+topic Sentry needs (ingest, downstream, commit-log, monitors, uptime, etc.).
+It runs in step 4e below from BM2 (where the `sentry_web` container is
+pinned). Nothing to do here.
 
 #### 4d. On BM3 — relay config + credentials
 
@@ -251,8 +249,13 @@ Relay self-recovers within ~30 s.
 WEB=$(sudo docker ps -qf "label=com.docker.swarm.service.name=sentry_web")
 SEAWEED=$(sudo docker ps -qf "label=com.docker.swarm.service.name=sentry_seaweedfs")
 
-# Schema migrations (idempotent) — required for the post-process forwarders
-sudo docker exec "$WEB" sentry upgrade --noinput
+# Schema migrations + Kafka topic creation (idempotent — matches what
+# install/set-up-and-migrate-database.sh runs for the single-node deploy).
+# The --create-kafka-topics flag is REQUIRED: it creates `events`,
+# `snuba-commit-log`, `outcomes`, `group-attributes`, and the rest of the
+# downstream topics the post-process forwarders need. Without it, issues
+# silently never get grouped and notification emails never fire.
+sudo docker exec "$WEB" sentry upgrade --noinput --create-kafka-topics
 
 # SeaweedFS buckets with 7-day lifecycle (matches SENTRY_EVENT_RETENTION_DAYS)
 sudo docker exec "$SEAWEED" apk add --no-cache s3cmd
@@ -611,11 +614,13 @@ docker stack rm sentry
 | `docker stack deploy` aborts with `failed to cast to expected type: parsing "": invalid syntax` on `healthcheck.retries` | `.env` wasn't sourced into the shell. `docker stack deploy` does not auto-load `.env` files (unlike `docker compose`). Run `set -a; source .env; [ -f .env.custom ] && source .env.custom; set +a` first. |
 | `docker stack deploy` rejects a service: name too long | Swarm caps service names at 63 chars *including* the `sentry_` stack prefix. Shorten the YAML key in `docker-stack.yml`. (The original `snuba-subscription-consumer-generic-metrics-distributions` was already shortened here.) |
 | `sentry_web` crash-loops with `ImproperlyConfigured: The SECRET_KEY setting must not be empty` | Bootstrap step 4a hasn't run, or 4b hasn't re-deployed after `.env.custom` was created. |
-| Consumers crash-loop with `KafkaError{code=UNKNOWN_TOPIC_OR_PART, ..., ingest-X}` | Broker auto-create is disabled. Run step 4c (create the 13 ingest topics). |
+| Events received but Issues stream stays empty AND no notification emails fire | `sentry upgrade` was run without `--create-kafka-topics`, so downstream topics (`events`, `snuba-commit-log`, `outcomes`, `group-attributes`, …) don't exist. `post-process-forwarder-errors` can't synchronize commits on `snuba-commit-log` and silently no-ops. Fix: on BM2, `sudo docker exec $(sudo docker ps -qf "name=sentry_web") sentry upgrade --noinput --create-kafka-topics`, then `docker service update --force sentry_post-process-forwarder-errors sentry_post-process-forwarder-transactions sentry_post-process-forwarder-issue-platform sentry_taskworker` on BM1. |
+| Consumers crash-loop with `KafkaError{code=UNKNOWN_TOPIC_OR_PART, ..., <topic>}` | Topic was never created. Re-run step 4e (`sentry upgrade --noinput --create-kafka-topics`) — idempotent. |
 | `sentry_relay` says `relay has no credentials, which are required in managed mode` even though `relay/credentials.json` exists | Relay also needs `relay/config.yml` to recognise `/work/.relay/` as a config folder. Run 4d. |
 | `sentry_seaweedfs` cycles every 3–4 min with healthcheck failures | Healthcheck must use `localhost`, not the service VIP. The Swarm VIP can route back to the same starting task during the `start_period` window. Already fixed in `docker-stack.yml`. |
 | Login fails with `CSRF Validation Failed` after typing credentials | `system.url-prefix` in `sentry/config.yml` is not set (or doesn't match the URL in the browser). Run 4f. |
-| 80%+ CPU on BM2 with no traffic | The 9 ingest consumers on BM2 are crash-looping every 3–6 s and burning Python startup. Almost always means Kafka topics are missing (4c). |
+| 80%+ CPU on BM2 with no traffic | Ingest consumers on BM2 are crash-looping every 3–6 s and burning Python startup. Almost always means Kafka topics are missing — re-run 4e. |
+| `SENTRY_SELF_HOSTED_ERRORS_ONLY` is unexpectedly `True` (transactions/replays/issue-platform features look disabled even though their consumers are running) | `COMPOSE_PROFILES` env var wasn't propagated to sentry containers. `docker-stack.yml`'s `x-sentry-defaults` now sets `COMPOSE_PROFILES: ${COMPOSE_PROFILES:-feature-complete}`. Re-source `.env` and `docker stack deploy` to roll the sentry services. |
 
 ### Runtime failures (after bootstrap)
 
@@ -640,9 +645,13 @@ Read this if you're familiar with the upstream `install.sh` flow:
 - **No `install.sh`**. The script runs `docker compose up` and `docker exec` which
   do not work in Swarm mode. Use `swarm-init.sh` + `swarm-bootstrap-sentry.sh`.
   Both reuse fragments from `install/` for secrets, relay credentials, and GeoIP.
-- **No `COMPOSE_PROFILES`**. Swarm doesn't understand profiles; all 72 services
-  always run. The `.env` setting remains for local-dev compatibility but is
-  ignored by `docker stack deploy`.
+- **Swarm doesn't gate services on `profiles:`** — all 72 services always run.
+  But `COMPOSE_PROFILES` is still propagated into sentry containers via
+  `x-sentry-defaults`, because `sentry/sentry.conf.example.py` reads it to
+  decide `SENTRY_SELF_HOSTED_ERRORS_ONLY`. Leave it at `feature-complete`
+  (the default in `.env`) unless you genuinely want errors-only behaviour;
+  otherwise transactions / replay / issue-platform notification handlers
+  silently no-op.
 - **All `ulimits:` blocks removed**. Set globally in `/etc/docker/daemon.json`
   because Swarm doesn't honour service-level ulimits.
 - **`build:` removed**. Local images are pre-built and distributed (or pushed to
@@ -668,9 +677,13 @@ Read this if you're familiar with the upstream `install.sh` flow:
   Swarm's IPVS may route the probe back to the just-starting task and fail
   before it's ready. Use `http://localhost:<port>` for the container's own
   healthcheck.
-- **Kafka broker has `auto.create.topics.enable=false`.** Consumers don't
-  trigger creation (only producers do), so 13 ingest topics must be created
-  explicitly during bootstrap. See step 4c.
+- **Kafka topic creation must run explicitly.** Even when Kafka's
+  `auto.create.topics.enable` is on, several downstream topics
+  (`snuba-commit-log`, `outcomes`, `group-attributes`, …) need specific
+  partition counts and configs that only `sentry upgrade --create-kafka-topics`
+  knows. Skip that flag and the post-process forwarders silently no-op —
+  events end up in ClickHouse but never become Issues and no emails fire.
+  See step 4e.
 - **Relay needs both `config.yml` AND `credentials.json`** in `/work/.relay/`.
   Upstream's `install/ensure-relay-credentials.sh` copies example → real
   before generating credentials. The swarm bootstrap script currently does

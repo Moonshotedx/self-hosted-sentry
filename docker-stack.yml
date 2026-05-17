@@ -48,6 +48,12 @@ x-sentry-defaults: &sentry_defaults
     DEFAULT_CA_BUNDLE: &ca_bundle "/etc/ssl/certs/ca-certificates.crt"
     REQUESTS_CA_BUNDLE: *ca_bundle
     GRPC_DEFAULT_SSL_ROOTS_FILE_PATH_ENV_VAR: *ca_bundle
+    # Swarm always deploys all 72 services regardless of profile, but
+    # sentry.conf.py keys `SENTRY_SELF_HOSTED_ERRORS_ONLY` off this env var
+    # (errors-only when not "feature-complete"). Without it, the post-process
+    # forwarders for transactions / issue-platform short-circuit and stop
+    # queueing notification tasks — emails for new issues never fire.
+    COMPOSE_PROFILES: "${COMPOSE_PROFILES:-feature-complete}"
     SENTRY_EVENT_RETENTION_DAYS:
     SENTRY_MAIL_HOST:
     SENTRY_MAX_EXTERNAL_SOURCEMAP_SIZE:
