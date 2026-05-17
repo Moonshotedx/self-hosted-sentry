@@ -168,11 +168,19 @@ if [[ -z "$WEB_CID" ]]; then
   warn "  docker exec \$(docker ps -qf name=sentry_web) sentry upgrade --noinput --create-kafka-topics"
   warn "  docker exec -it \$(docker ps -qf name=sentry_web) sentry createuser --email <admin@example.com> --superuser"
 else
-  # --create-kafka-topics matches install/set-up-and-migrate-database.sh and
-  # is what creates `events`, `snuba-commit-log`, `outcomes`, etc. Without it,
-  # post-process-forwarder-errors cannot synchronize on snuba-commit-log →
-  # issues are written to ClickHouse but never grouped → no notifications/emails.
-  log "Running sentry upgrade (database migrations + Kafka topic creation)"
+  # --create-kafka-topics matches install/set-up-and-migrate-database.sh.
+  # NOTE: per getsentry/sentry#103438, this flag is misnamed — internally it
+  # calls `wait_for_topics()`, not `AdminClient.create_topics()`. It does
+  # trigger broker-side auto-create indirectly (the metadata requests it
+  # issues set allow_auto_topic_creation=true), so as long as
+  # `auto.create.topics.enable=true` on the broker (the cp-kafka default,
+  # which we rely on), every Sentry-side schema topic gets created at this
+  # point with the broker's `num.partitions` default. That default MUST be 1
+  # — `docker-stack.yml`'s kafka service deliberately omits
+  # `KAFKA_NUM_PARTITIONS` so that auto-created topics like `snuba-commit-log`
+  # come up with `PartitionCount=1` to match snuba's hardcoded
+  # `num_partitions=1` and sentry-kafka-schemas' `enforced_partition_count: 1`.
+  log "Running sentry upgrade (DB migrations + Kafka topic wait/auto-create)"
   docker exec "$WEB_CID" sentry upgrade --noinput --create-kafka-topics
   log "All migrations applied. Create the first superuser interactively:"
   echo "  docker exec -it $WEB_CID sentry createuser --email <admin@example.com> --superuser"

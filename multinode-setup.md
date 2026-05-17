@@ -614,7 +614,7 @@ docker stack rm sentry
 | `docker stack deploy` aborts with `failed to cast to expected type: parsing "": invalid syntax` on `healthcheck.retries` | `.env` wasn't sourced into the shell. `docker stack deploy` does not auto-load `.env` files (unlike `docker compose`). Run `set -a; source .env; [ -f .env.custom ] && source .env.custom; set +a` first. |
 | `docker stack deploy` rejects a service: name too long | Swarm caps service names at 63 chars *including* the `sentry_` stack prefix. Shorten the YAML key in `docker-stack.yml`. (The original `snuba-subscription-consumer-generic-metrics-distributions` was already shortened here.) |
 | `sentry_web` crash-loops with `ImproperlyConfigured: The SECRET_KEY setting must not be empty` | Bootstrap step 4a hasn't run, or 4b hasn't re-deployed after `.env.custom` was created. |
-| Events received but Issues stream stays empty AND no notification emails fire | `sentry upgrade` was run without `--create-kafka-topics`, so downstream topics (`events`, `snuba-commit-log`, `outcomes`, `group-attributes`, …) don't exist. `post-process-forwarder-errors` can't synchronize commits on `snuba-commit-log` and silently no-ops. Fix: on BM2, `sudo docker exec $(sudo docker ps -qf "name=sentry_web") sentry upgrade --noinput --create-kafka-topics`, then on BM1 roll the affected services one at a time: `for svc in sentry_post-process-forwarder-errors sentry_post-process-forwarder-transactions sentry_post-process-forwarder-issue-platform sentry_taskworker; do docker service update --force "$svc"; done` (`docker service update` only accepts one service per call). |
+| Events received but Issues stream stays empty AND no notification emails fire | Most likely `snuba-commit-log` got broker-auto-created with >1 partition before `snuba bootstrap` ran, so the post-process-forwarder's SynchronizedConsumer stalls (commit-log keys hash across partitions, watermarks never advance). `snuba-commit-log` declares `enforced_partition_count: 1` in sentry-kafka-schemas. Diagnose on BM1: `docker exec $(docker ps -qf name=sentry_kafka) kafka-topics --bootstrap-server localhost:9092 --describe --topic snuba-commit-log` — if `PartitionCount` is not `1`, you've hit this. Fix: stop the affected consumer groups, delete the topic, let snuba recreate it, then restart. See "Repairing a misaligned snuba-commit-log" below. Root cause was `KAFKA_NUM_PARTITIONS: "12"` in `docker-stack.yml` combined with broker `auto.create.topics.enable=true` — the 12 setting is now removed. |
 | Consumers crash-loop with `KafkaError{code=UNKNOWN_TOPIC_OR_PART, ..., <topic>}` | Topic was never created. Re-run step 4e (`sentry upgrade --noinput --create-kafka-topics`) — idempotent. |
 | `sentry_relay` says `relay has no credentials, which are required in managed mode` even though `relay/credentials.json` exists | Relay also needs `relay/config.yml` to recognise `/work/.relay/` as a config folder. Run 4d. |
 | `sentry_seaweedfs` cycles every 3–4 min with healthcheck failures | Healthcheck must use `localhost`, not the service VIP. The Swarm VIP can route back to the same starting task during the `start_period` window. Already fixed in `docker-stack.yml`. |
@@ -633,6 +633,59 @@ docker stack rm sentry
 | Postgres slow | `docker exec $(docker ps -qf name=sentry_postgres) psql -U postgres -c "SELECT * FROM pg_stat_activity WHERE state='active'"` |
 | SeaweedFS full | `docker exec $(docker ps -qf name=sentry_seaweedfs) df -h /data`; consider externalizing buckets (§"Disk layout" #3) |
 | Cross-node service can't resolve another | Confirm overlay DNS (`docker exec ... python -c "import socket; ..."`). If broken, restart docker on the affected node. |
+
+### Repairing a misaligned `snuba-commit-log`
+
+If `kafka-topics --describe --topic snuba-commit-log` shows a `PartitionCount` other than 1, the post-process-forwarder is stalling silently. Repair on BM1:
+
+```bash
+KAFKA=$(docker ps -qf "label=com.docker.swarm.service.name=sentry_kafka")
+
+# 1. Stop the consumer groups that read/write the commit log so we can recreate the topic.
+#    (Pausing services on BM1 + BM2; tasks queue up safely.)
+for svc in sentry_snuba-errors-consumer \
+           sentry_snuba-transactions-consumer \
+           sentry_snuba-issue-occurrence-consumer \
+           sentry_post-process-forwarder-errors \
+           sentry_post-process-forwarder-transactions \
+           sentry_post-process-forwarder-issue-platform; do
+  docker service scale "$svc"=0
+done
+
+# 2. Delete the misaligned topic (only the commit-log, NOT the events topic).
+docker exec "$KAFKA" kafka-topics --bootstrap-server localhost:9092 --delete --topic snuba-commit-log
+# If you also see PartitionCount != 1 on snuba-transactions-commit-log or
+# snuba-generic-events-commit-log, delete those too with the same command.
+
+# 3. Re-bootstrap snuba so it recreates the commit-log topics with the correct
+#    partition count (snuba hardcodes num_partitions=1 for these).
+SNUBA=$(docker ps -qf "label=com.docker.swarm.service.name=sentry_snuba-api")
+docker exec "$SNUBA" snuba bootstrap --force --no-migrate
+
+# 4. Confirm partition count is now 1.
+docker exec "$KAFKA" kafka-topics --bootstrap-server localhost:9092 --describe --topic snuba-commit-log
+# → PartitionCount: 1
+
+# 5. Bring the consumers back.
+for svc in sentry_snuba-errors-consumer \
+           sentry_snuba-transactions-consumer \
+           sentry_snuba-issue-occurrence-consumer \
+           sentry_post-process-forwarder-errors \
+           sentry_post-process-forwarder-transactions \
+           sentry_post-process-forwarder-issue-platform; do
+  docker service scale "$svc"=1
+done
+
+# 6. On BM2, force-roll the consumer-side state.
+ssh <BM2> 'for svc in sentry_post-process-forwarder-errors \
+                       sentry_post-process-forwarder-transactions \
+                       sentry_post-process-forwarder-issue-platform \
+                       sentry_taskworker; do
+  docker service update --force "$svc"
+done'
+```
+
+Send a test event; the next `post-process-forwarder-errors` log line should show it being grouped, and notification emails should start firing for matching alert rules.
 
 ---
 
@@ -677,13 +730,21 @@ Read this if you're familiar with the upstream `install.sh` flow:
   Swarm's IPVS may route the probe back to the just-starting task and fail
   before it's ready. Use `http://localhost:<port>` for the container's own
   healthcheck.
-- **Kafka topic creation must run explicitly.** Even when Kafka's
-  `auto.create.topics.enable` is on, several downstream topics
-  (`snuba-commit-log`, `outcomes`, `group-attributes`, …) need specific
-  partition counts and configs that only `sentry upgrade --create-kafka-topics`
-  knows. Skip that flag and the post-process forwarders silently no-op —
-  events end up in ClickHouse but never become Issues and no emails fire.
-  See step 4e.
+- **Kafka topic creation is split between `snuba bootstrap` and broker
+  auto-create — both have to land 1-partition topics for `snuba-commit-log`
+  to work.** `snuba bootstrap` uses `AdminClient.create_topics(NewTopic(..., num_partitions=1))`
+  for `snuba-commit-log`, `events`, `outcomes`, `group-attributes`, etc.
+  Ingest-side and taskworker-side topics aren't in that list and rely on
+  broker auto-create. The Sentry flag `sentry upgrade --create-kafka-topics`
+  is misnamed (getsentry/sentry#103438) — it doesn't create, it `wait_for_topics`,
+  but its metadata requests carry `allow_auto_topic_creation=true`, so the
+  broker creates them with its `num.partitions` default. Keep that default
+  at 1 — the prior `KAFKA_NUM_PARTITIONS: "12"` in `docker-stack.yml` caused
+  any commit-log topic that lost the race with `snuba bootstrap` to come up
+  with 12 partitions, silently stalling the post-process-forwarder
+  (sentry-kafka-schemas marks the commit-log topics with
+  `enforced_partition_count: 1`). See step 4e and the "Repairing a misaligned
+  snuba-commit-log" recipe.
 - **Relay needs both `config.yml` AND `credentials.json`** in `/work/.relay/`.
   Upstream's `install/ensure-relay-credentials.sh` copies example → real
   before generating credentials. The swarm bootstrap script currently does
