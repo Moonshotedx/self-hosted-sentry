@@ -13,13 +13,14 @@
 #      relay logs "launching relay without config folder" and ignores creds).
 #      Generates relay/credentials.json (if missing).
 #   3. Downloads GeoIP databases.
-#   4. Creates the 13 ingest Kafka topics (Sentry consumers don't auto-create;
-#      broker has auto.create.topics.enable=false).
-#   5. Creates SeaweedFS buckets: `nodestore`, `profiles`. Applies lifecycle rules
+#   4. Creates SeaweedFS buckets: `nodestore`, `profiles`. Applies lifecycle rules
 #      keyed to SENTRY_EVENT_RETENTION_DAYS.
-#   6. Runs sentry upgrade --noinput (schema migrations).
-#   7. Runs snuba bootstrap + migrations.
-#   8. Prompts to create the first superuser AND to set system.url-prefix
+#   5. Runs `sentry upgrade --noinput --create-kafka-topics` (schema migrations
+#      AND creation of every Kafka topic Sentry needs — `events`,
+#      `snuba-commit-log`, `outcomes`, `group-attributes`, all `ingest-*`, etc.).
+#      Matches install/set-up-and-migrate-database.sh in the single-node flow.
+#   6. Runs snuba bootstrap + migrations (creates snuba-* topics it owns).
+#   7. Prompts to create the first superuser AND to set system.url-prefix
 #      (without which login hits "CSRF Validation Failed").
 
 set -euo pipefail
@@ -29,6 +30,22 @@ cd "$REPO_ROOT"
 
 # shellcheck disable=SC1091
 source .env
+
+# SSH key / user for the rsync / ssh hints we print at the end (relay creds
+# to BM3, config.yml to BM2). Same convention as scripts/swarm-init.sh: set
+# SSH_KEY to an absolute private-key path and SSH_USER to the remote user
+# (defaults to root). If unset, the printed hints fall back to bare
+# `ssh user@host` / `rsync -a` which will use the running user's default
+# agent / key chain.
+SSH_USER="${SSH_USER:-root}"
+SSH_KEY="${SSH_KEY:-}"
+if [[ -n "$SSH_KEY" ]]; then
+  SSH_HINT="ssh -i ${SSH_KEY} ${SSH_USER}@"
+  RSYNC_HINT="rsync -a -e 'ssh -i ${SSH_KEY}' "
+else
+  SSH_HINT="ssh ${SSH_USER}@"
+  RSYNC_HINT="rsync -a "
+fi
 
 log() { printf "\n\033[1;32m[%s]\033[0m %s\n" "bootstrap" "$*"; }
 warn() { printf "\n\033[1;33m[%s]\033[0m %s\n" "bootstrap" "$*"; }
@@ -84,7 +101,7 @@ if [[ ! -f relay/credentials.json ]]; then
   fi
   warn "relay/credentials.json was generated on BM1. The relay container is pinned to BM3."
   warn "Sync the file (and relay/config.yml) to BM3 before relay can start:"
-  warn "  rsync -a relay/ root@<BM3-IP>:/opt/sentry/self-hosted/relay/"
+  warn "  ${RSYNC_HINT}relay/ ${SSH_USER}@<BM3-IP>:/opt/sentry/self-hosted/relay/"
 fi
 
 if [[ ! -f geoip/GeoLite2-City.mmdb ]]; then
@@ -93,37 +110,21 @@ if [[ ! -f geoip/GeoLite2-City.mmdb ]]; then
 fi
 
 # ------------------------------------------------------------------------------
-# 2. Kafka ingest topics
-#    Sentry's consumers subscribe to these topics but don't trigger topic
-#    auto-creation (only producers do). Broker has auto.create.topics.enable=false,
-#    so missing topics → consumers crash-loop every 3-6s on UNKNOWN_TOPIC_OR_PART,
-#    which puts BM2 at >80% CPU. Create them upfront, idempotently.
-#    Snuba creates its own snuba-* topics during `snuba bootstrap` below; these
-#    are the ingest-side ones that Sentry needs.
+# 2. Wait for Kafka to be reachable
+#    All Sentry topics (ingest-*, events, transactions, snuba-commit-log,
+#    snuba-transactions-commit-log, snuba-generic-events-commit-log, outcomes,
+#    group-attributes, etc.) are created by `sentry upgrade --create-kafka-topics`
+#    in step 4 below — the same flag the single-node install.sh uses
+#    (install/set-up-and-migrate-database.sh). We don't create them by hand here
+#    because the manual list always drifts behind upstream's, and missing
+#    downstream topics (especially snuba-commit-log) silently break
+#    post-process-forwarder → no issue grouping → no notification emails.
+#    Snuba's own snuba-* topics are still created by `snuba bootstrap` below.
+#    This just blocks until the kafka container is up on BM1 so step 4/5 don't
+#    race the broker.
 # ------------------------------------------------------------------------------
 KAFKA_CID="$(find_local_container kafka)"
-INGEST_TOPICS=(
-  ingest-attachments
-  ingest-events
-  ingest-transactions
-  ingest-metrics
-  ingest-performance-metrics
-  ingest-replay-recordings
-  ingest-feedback-events
-  ingest-occurrences
-  profiles
-  buffered-segments
-  ingest-spans
-  monitors-clock-tasks
-  uptime-results
-)
-log "Creating Kafka ingest topics (idempotent)"
-for topic in "${INGEST_TOPICS[@]}"; do
-  docker exec "$KAFKA_CID" kafka-topics --bootstrap-server localhost:9092 \
-    --create --if-not-exists --topic "$topic" \
-    --partitions 1 --replication-factor 1 >/dev/null
-done
-log "Created/verified ${#INGEST_TOPICS[@]} ingest topics"
+log "Kafka is up ($KAFKA_CID). Topic creation deferred to step 4 ('sentry upgrade --create-kafka-topics' on BM2) and step 5 ('snuba bootstrap')."
 
 # ------------------------------------------------------------------------------
 # 3. SeaweedFS buckets + lifecycle policies
@@ -180,11 +181,23 @@ fi
 WEB_CID="$(docker ps --filter "label=com.docker.swarm.service.name=sentry_web" --format '{{.ID}}' | head -1 || true)"
 if [[ -z "$WEB_CID" ]]; then
   warn "sentry_web is not running on this host (it's pinned to BM2). SSH to BM2 and run:"
-  warn "  docker exec \$(docker ps -qf name=sentry_web) sentry upgrade --noinput"
+  warn "  docker exec \$(docker ps -qf name=sentry_web) sentry upgrade --noinput --create-kafka-topics"
   warn "  docker exec -it \$(docker ps -qf name=sentry_web) sentry createuser --email <admin@example.com> --superuser"
 else
-  log "Running sentry upgrade (database migrations)"
-  docker exec "$WEB_CID" sentry upgrade --noinput
+  # --create-kafka-topics matches install/set-up-and-migrate-database.sh.
+  # NOTE: per getsentry/sentry#103438, this flag is misnamed — internally it
+  # calls `wait_for_topics()`, not `AdminClient.create_topics()`. It does
+  # trigger broker-side auto-create indirectly (the metadata requests it
+  # issues set allow_auto_topic_creation=true), so as long as
+  # `auto.create.topics.enable=true` on the broker (the cp-kafka default,
+  # which we rely on), every Sentry-side schema topic gets created at this
+  # point with the broker's `num.partitions` default. That default MUST be 1
+  # — `docker-stack.yml`'s kafka service deliberately omits
+  # `KAFKA_NUM_PARTITIONS` so that auto-created topics like `snuba-commit-log`
+  # come up with `PartitionCount=1` to match snuba's hardcoded
+  # `num_partitions=1` and sentry-kafka-schemas' `enforced_partition_count: 1`.
+  log "Running sentry upgrade (DB migrations + Kafka topic wait/auto-create)"
+  docker exec "$WEB_CID" sentry upgrade --noinput --create-kafka-topics
   log "All migrations applied. Create the first superuser interactively:"
   echo "  docker exec -it $WEB_CID sentry createuser --email <admin@example.com> --superuser"
 fi
@@ -205,12 +218,12 @@ Sentry multinode bootstrap complete (BM1 portion).
 
 Still required — must run BY HAND because the target containers aren't on BM1:
 
-  ON BM3 (or rsync the relay/ dir from here):
-    rsync -a /opt/sentry/self-hosted/relay/ root@<BM3-IP>:/opt/sentry/self-hosted/relay/
+  FROM BM1 → push relay creds to BM3:
+    ${RSYNC_HINT}/opt/sentry/self-hosted/relay/ ${SSH_USER}@<BM3-IP>:/opt/sentry/self-hosted/relay/
 
   ON BM2 (sentry_web is pinned there):
     WEB=\$(sudo docker ps -qf "label=com.docker.swarm.service.name=sentry_web")
-    sudo docker exec    "\$WEB" sentry upgrade --noinput          # idempotent
+    sudo docker exec    "\$WEB" sentry upgrade --noinput --create-kafka-topics   # idempotent
     sudo docker exec -it "\$WEB" sentry createuser --superuser
 
   ON BM1 (fix CSRF before browser login — otherwise login fails with
@@ -218,7 +231,7 @@ Still required — must run BY HAND because the target containers aren't on BM1:
   http://localhost:9000):
     sed -i "s|^# system.url-prefix:.*|system.url-prefix: 'http://<BM3-IP>:${SENTRY_BIND:-9000}'|" \\
       sentry/config.yml
-    rsync -a sentry/config.yml root@<BM2-IP>:/opt/sentry/self-hosted/sentry/config.yml
+    ${RSYNC_HINT}sentry/config.yml ${SSH_USER}@<BM2-IP>:/opt/sentry/self-hosted/sentry/config.yml
     docker service update --force sentry_web
 
 Then verify:

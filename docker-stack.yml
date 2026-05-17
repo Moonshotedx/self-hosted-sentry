@@ -48,6 +48,12 @@ x-sentry-defaults: &sentry_defaults
     DEFAULT_CA_BUNDLE: &ca_bundle "/etc/ssl/certs/ca-certificates.crt"
     REQUESTS_CA_BUNDLE: *ca_bundle
     GRPC_DEFAULT_SSL_ROOTS_FILE_PATH_ENV_VAR: *ca_bundle
+    # Swarm always deploys all 72 services regardless of profile, but
+    # sentry.conf.py keys `SENTRY_SELF_HOSTED_ERRORS_ONLY` off this env var
+    # (errors-only when not "feature-complete"). Without it, the post-process
+    # forwarders for transactions / issue-platform short-circuit and stop
+    # queueing notification tasks — emails for new issues never fire.
+    COMPOSE_PROFILES: "${COMPOSE_PROFILES:-feature-complete}"
     SENTRY_EVENT_RETENTION_DAYS:
     SENTRY_MAIL_HOST:
     SENTRY_MAX_EXTERNAL_SOURCEMAP_SIZE:
@@ -249,7 +255,18 @@ services:
       KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
       KAFKA_OFFSETS_TOPIC_NUM_PARTITIONS: "1"
-      KAFKA_NUM_PARTITIONS: "12"
+      # Auto-create has to stay ON: Sentry's `upgrade --create-kafka-topics`
+      # is misnamed — it only waits for topics, it does NOT create them
+      # (getsentry/sentry#103438). Producers (relay, events-consumer,
+      # post-process-forwarder, taskbroker) rely on broker auto-create for
+      # topics that `snuba bootstrap` doesn't own (ingest-*, taskworker-*,
+      # DLQ/backlog). DO NOT set KAFKA_NUM_PARTITIONS above the broker default
+      # of 1: `snuba-commit-log` declares `enforced_partition_count: 1` and
+      # the SynchronizedConsumer in `post-process-forwarder` stalls silently
+      # if commit-log keys get hashed across multiple partitions. Symptom:
+      # events land in ClickHouse but Issues stay empty and no notification
+      # emails fire — the exact bug this stack was hitting with the prior
+      # `KAFKA_NUM_PARTITIONS: "12"` setting. Leave the default (1) here.
       KAFKA_LOG_RETENTION_HOURS: "24"
       KAFKA_MESSAGE_MAX_BYTES: "50000000"
       KAFKA_MAX_REQUEST_SIZE: "50000000"

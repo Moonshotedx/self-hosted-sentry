@@ -19,6 +19,15 @@
 #   REGISTRY — if set (e.g. "registry.example.com:5000"), images are pushed instead
 #              of saved+ssh-loaded. Recommended for production.
 #   SENTRY_VERSION — defaults to 26.4.2 (matches .env's SENTRY_IMAGE tag).
+#   SSH_KEY — absolute path to a private SSH key authorised on BM2 and BM3
+#             (e.g. /root/.ssh/sentry-swarm). Used for the `docker save | ssh`
+#             image-distribution step and printed into the operator's rsync /
+#             ssh hints. If unset, ssh uses whatever the running user's default
+#             agent / key chain resolves — fine if you've already set up
+#             passwordless ssh another way.
+#   SSH_USER — remote user on BM2 / BM3 (default: root). Must own a writable
+#              /opt/sentry/self-hosted and be in the docker group on the
+#              remote node.
 #
 # Run BM2/BM3 join + their own volume/daemon.json steps manually after this finishes;
 # search for "RUN-ON-BM2" and "RUN-ON-BM3" tags below for the exact commands to copy.
@@ -29,11 +38,49 @@ set -euo pipefail
 : "${BM2_IP:?Set BM2_IP to the private IP of BM2}"
 : "${BM3_IP:?Set BM3_IP to the private IP of BM3}"
 SENTRY_VERSION="${SENTRY_VERSION:-26.4.2}"
+SSH_USER="${SSH_USER:-root}"
+SSH_KEY="${SSH_KEY:-}"
+
+# Build SSH/RSYNC command prefixes that respect SSH_KEY/SSH_USER. We disable
+# strict host-key checking on first contact because the operator just pointed
+# at three IPs — there's no opportunity to TOFU before this runs. If you've
+# already collected fingerprints in known_hosts, this is a no-op.
+SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o BatchMode=yes)
+if [[ -n "$SSH_KEY" ]]; then
+  if [[ ! -r "$SSH_KEY" ]]; then
+    echo "SSH_KEY=$SSH_KEY is not readable. Set it to an absolute path or unset it." >&2
+    exit 1
+  fi
+  SSH_OPTS+=(-i "$SSH_KEY")
+fi
+
+ssh_to()  { ssh   "${SSH_OPTS[@]}" "${SSH_USER}@$1" "${@:2}"; }
+# Hint string we'll print into operator-facing rsync/ssh examples so they
+# match what the script itself uses.
+if [[ -n "$SSH_KEY" ]]; then
+  SSH_HINT="ssh -i $SSH_KEY ${SSH_USER}@"
+  RSYNC_HINT="rsync -a -e 'ssh -i $SSH_KEY' "
+else
+  SSH_HINT="ssh ${SSH_USER}@"
+  RSYNC_HINT="rsync -a "
+fi
+export SSH_KEY SSH_USER SSH_HINT RSYNC_HINT
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 log() { printf "\n\033[1;36m[%s]\033[0m %s\n" "swarm-init" "$*"; }
+
+# Sanity-check ssh to BM2 and BM3 before we burn time building images we
+# can't ship. Cheaper to fail here than at the `docker save | ssh` step.
+for host in "$BM2_IP" "$BM3_IP"; do
+  log "Verifying ssh ${SSH_USER}@${host}"
+  if ! ssh_to "$host" 'echo ok' >/dev/null 2>&1; then
+    echo "Could not ssh to ${SSH_USER}@${host} with the configured key." >&2
+    echo "Either fix the key/agent and re-run, or set SSH_KEY to an absolute path." >&2
+    exit 1
+  fi
+done
 
 # ------------------------------------------------------------------------------
 # 0. Make sure sentry/config.yml and sentry/sentry.conf.py exist
@@ -130,9 +177,9 @@ else
   log "No REGISTRY set — saving images and copying via ssh to BM2 ($BM2_IP) and BM3 ($BM3_IP)"
   for img in "${LOCAL_IMAGES[@]}"; do
     log "  shipping $img → BM2"
-    docker save "$img" | ssh "$BM2_IP" 'docker load'
+    docker save "$img" | ssh_to "$BM2_IP" 'docker load'
     log "  shipping $img → BM3"
-    docker save "$img" | ssh "$BM3_IP" 'docker load'
+    docker save "$img" | ssh_to "$BM3_IP" 'docker load'
   done
 fi
 
@@ -192,8 +239,9 @@ NEXT STEPS — run these manually on BM2 and BM3:
 RUN-ON-BM2 (the "app" tier, 48 GB):
   # 1. Join Swarm: paste the join command from above
   # 2. /etc/docker/daemon.json: same content as BM1, then 'systemctl restart docker'
-  # 3. Clone repo to /opt/sentry/self-hosted (or rsync from BM1) so bind mounts resolve
-  # 4. Create app-tier volumes:
+  # 3. Sync the repo from BM1 (run this FROM BM1):
+  ${RSYNC_HINT}/opt/sentry/self-hosted/ ${SSH_USER}@${BM2_IP}:/opt/sentry/self-hosted/
+  # 4. Create app-tier volumes (run this ON BM2):
   docker volume create sentry-data
   docker volume create sentry-seaweedfs
   docker volume create sentry-symbolicator
@@ -203,8 +251,9 @@ RUN-ON-BM2 (the "app" tier, 48 GB):
 RUN-ON-BM3 (the "edge" tier, 32 GB):
   # 1. Join Swarm: paste the join command from above
   # 2. /etc/docker/daemon.json: same content as BM1, then 'systemctl restart docker'
-  # 3. Clone repo to /opt/sentry/self-hosted (or rsync from BM1)
-  # 4. Create edge-tier volumes:
+  # 3. Sync the repo from BM1 (run this FROM BM1):
+  ${RSYNC_HINT}/opt/sentry/self-hosted/ ${SSH_USER}@${BM3_IP}:/opt/sentry/self-hosted/
+  # 4. Create edge-tier volumes (run this ON BM3):
   docker volume create sentry-redis
   docker volume create sentry-smtp
   docker volume create sentry-smtp-log
@@ -215,6 +264,9 @@ THEN — back on BM1:
   docker node ls                     # confirm 3 managers visible
   docker node update --label-add sentry.role=app  <BM2-hostname>
   docker node update --label-add sentry.role=edge <BM3-hostname>
+  # The bootstrap script picks up SSH_KEY/SSH_USER from the environment, so
+  # if you exported them for this script, just keep them exported (or use
+  # \`sudo -E …\`) before running:
   bash scripts/swarm-bootstrap-sentry.sh
 ================================================================================
 EOF
